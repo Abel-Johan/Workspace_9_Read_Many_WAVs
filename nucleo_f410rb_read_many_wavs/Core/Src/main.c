@@ -104,15 +104,26 @@ uint32_t ccr_l[2048]; // Array to store CCR values for left channel. The PWM fun
 uint32_t ccr_r[2048]; // Array to store CCR values for right channel. The PWM function requires CCR to be a 32-bit integer to work properly.
 uint32_t data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
 uint32_t skip = 12; // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
-uint32_t skip_fmt = 0; // skip variable to record down the start of the fmt chunk's useful data
-uint32_t skip_data = 0; // skip variable to record down the start of the data chunk's useful data
-uint32_t ARR;                 // Variable to store ARR value
+uint32_t skip_fmt = 0; // skip variable to record down and increment the start of the fmt chunk's useful data
+uint32_t skip_data = 0; // skip variable to record down and increment the start of the data chunk's useful data
+uint32_t ARR; // Variable to store ARR value
+uint32_t data_start; // Variable to record down to start of the audio data.
 
 UINT br; // Variable to store bytes read for use when reading files
 
 FIL file; // File variable
 FRESULT res; // Result of file operations with FATFS. Mostly useful for debugging.
 extern char sd_path[4];
+
+const uint32_t DEBOUNCE_TIME = 20; // Ignore rogue button bounces, this is the time in ms to ignore successive button presses
+const uint32_t SUCCESSIVE_BUTTON_PRESS_TIME = 600; // Wait for this amount of time before deciding between single or double press
+
+volatile uint8_t previous_state; // Boolean variable to store the previous state of the button
+volatile uint8_t pressed; // Boolean variable to store current state of button. pressed = 1, released = 0
+volatile uint8_t waiting; // Boolean variable to store the state of whether we are waiting for a second button press or not
+volatile uint32_t press_time; // Tick of button press
+volatile uint32_t release_time; // Tick of button release
+volatile uint8_t play = 1; // Boolean variable to store whether to play or not (play vs pause/stop)
 
 // Define an enumeration variable which will tell the code to refill the first or second half of the bufr/ccr array.
 // refill_request needs to be volatile because it will be accessed by the interrupt
@@ -123,6 +134,14 @@ enum refill_t {
 };
 
 volatile enum refill_t refill_request = REFILL_NONE;
+
+// Define an enumeration variable which will tell the code to pause/resume, skip, or rewind based on button press
+// As above, button_request needs to be volatile
+enum button_t {
+	BUTTON_IDLE, BUTTON_SINGLE_PRESS, BUTTON_DOUBLE_PRESS, BUTTON_LONG_PRESS
+};
+
+volatile enum button_t button_state = BUTTON_IDLE;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -148,6 +167,7 @@ int _write(int fd, unsigned char *buf, int len) {
 
 // Define a function to determine whether a file is .wav or not
 static uint8_t has_wav_extension(char *name) {
+	// Find position of dot
 	const char *dot = strrchr(name, '.');
 	// Case of file has no dot/no extension
 	if (!dot)
@@ -409,6 +429,42 @@ static void process_pcm(uint8_t mode, const uint32_t ARR) {
 	}
 }
 
+// Called by main either if button interrupt or waiting is true
+enum button_t process_button(void) {
+	uint32_t now = HAL_GetTick();
+	enum button_t button_event = BUTTON_IDLE;
+
+	// If button is pressed (doesn't matter if it is first or second press)
+	// Need both because we are considering an edge, not just the value itself.
+	if (pressed && !previous_state) {
+		press_time = now;
+	// Else if button was released the first time
+	// Need both because we are considering an edge, not just the value itself.
+	} else if (!pressed && previous_state) {
+		release_time = now;
+
+		if (release_time - press_time >= SUCCESSIVE_BUTTON_PRESS_TIME) {
+			waiting = 0;
+			button_event = BUTTON_LONG_PRESS;
+		}
+		// Else if button was released the second time
+		else if (waiting) {
+			waiting = 0;
+			button_event = BUTTON_DOUBLE_PRESS;
+		} else {
+		waiting = 1;
+		}
+	}
+
+	// Separately, if it's been 500 ms since the first button release, and the button is not pressed at the moment
+	if (waiting && !pressed & ((now - release_time) >= SUCCESSIVE_BUTTON_PRESS_TIME)) {
+		waiting = 0;
+		button_event = BUTTON_SINGLE_PRESS;
+	}
+	previous_state = pressed;
+	return button_event;
+}
+
 // Function called when first half of the array has been transmitted to PWM
 // We thus need to change the contents of the first half of the buffer and ccr
 void HAL_TIM_PWM_PulseFinishedHalfCpltCallback(TIM_HandleTypeDef *htim) {
@@ -425,42 +481,55 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
 		refill_request = REFILL_SECOND;
 	}
 }
+
+// Function called when an External Interrupt event happens. In this case, the blue button being pushed
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	if (GPIO_Pin == GPIO_PIN_13) {
+		uint32_t now = HAL_GetTick();
+
+		if ((now - release_time) > DEBOUNCE_TIME) {
+			// Button is active-low due to a pull-up resistor. So when pin is 1, button is actually not pressed/pressed = 0.
+			pressed = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET);
+		}
+	}
+}
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
-	/* USER CODE BEGIN 1 */
+  /* USER CODE BEGIN 1 */
 
-	/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
-	/* MCU Configuration--------------------------------------------------------*/
+  /* MCU Configuration--------------------------------------------------------*/
 
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-	HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-	/* USER CODE BEGIN Init */
+  /* USER CODE BEGIN Init */
 
-	/* USER CODE END Init */
+  /* USER CODE END Init */
 
-	/* Configure the system clock */
-	SystemClock_Config();
+  /* Configure the system clock */
+  SystemClock_Config();
 
-	/* USER CODE BEGIN SysInit */
+  /* USER CODE BEGIN SysInit */
 
-	/* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
-	/* Initialize all configured peripherals */
-	MX_GPIO_Init();
-	MX_DMA_Init();
-	MX_SPI1_Init();
-	MX_TIM5_Init();
-	MX_USART2_UART_Init();
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_SPI1_Init();
+  MX_TIM5_Init();
+  MX_USART2_UART_Init();
 //  MX_FATFS_Init();
-	/* USER CODE BEGIN 2 */
+  /* USER CODE BEGIN 2 */
 	// This is where we change the Baud Rate Prescaler to make the SD card read/write speed faster
 	// Temporarily disable the SPI if we want to change the baud rate
 	__HAL_SPI_DISABLE(&hspi1);
@@ -491,10 +560,10 @@ int main(void) {
 		printf("Failed to open Music directory with error: %d\r\n", res);
 		return 1;
 	}
-	/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
-	/* Infinite loop */
-	/* USER CODE BEGIN WHILE */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
 	// 1b. For every WAV file in Music folder:
 	while (1) {
 		data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
@@ -581,6 +650,7 @@ int main(void) {
 			else if (memcmp(chunk_id, exp_data, (int) sizeof(exp_data)) == 0) {
 				printf("Found DATA chunk.\r\n");
 				skip_data = skip;
+				data_start = skip;
 				data_size_dec = chunk_size_dec;
 			}
 			// Skip any other chunk
@@ -684,264 +754,315 @@ int main(void) {
 				sizeof(ccr_l) / sizeof(ccr_l[0]));
 		HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
 				sizeof(ccr_r) / sizeof(ccr_r[0]));
-		/* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-		/* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
 		while (1) {
-			if (data_bytes_read < data_size_dec) {
-				if (refill_request == REFILL_FIRST) {
-					refill_request = REFILL_NONE;
-					// Function to replace the first half of ccr's
-					process_pcm(1, ARR);
-				} else if (refill_request == REFILL_SECOND) {
-					refill_request = REFILL_NONE;
-					// Function to replace the second half of ccr's
-					process_pcm(2, ARR);
+			button_state = process_button();
+
+			// If Idle and play is on, play as per normal
+			if (button_state == BUTTON_IDLE) {
+				if (play) {
+					if (data_bytes_read < data_size_dec) {
+						if (refill_request == REFILL_FIRST) {
+							refill_request = REFILL_NONE;
+							// Function to replace the first half of ccr's
+							process_pcm(1, ARR);
+						} else if (refill_request == REFILL_SECOND) {
+							refill_request = REFILL_NONE;
+							// Function to replace the second half of ccr's
+							process_pcm(2, ARR);
+						}
+					} else if (data_bytes_read == data_size_dec) {
+						// You have now finished reading the PCM data
+						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
+						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
+
+						res = f_close(&file);
+						if (res != FR_OK) {
+							printf("f_close failed with code: %d\r\n", res);
+							return res;
+						}
+
+						// Verify that we have read the entire data chunk upon unmount
+						printf("Bytes of data read: %lu bytes\r\n", data_bytes_read);
+						printf("Bytes of data actually there: %lu bytes \r\n",
+								data_size_dec);
+						printf("DATA chunk processed. Step 4 success.\r\n\n");
+
+						break;
+					}
 				}
-			} else if (data_bytes_read == data_size_dec) {
-				// You have now finished reading the PCM data
-				HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
-				HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
-
-				res = f_close(&file);
-				if (res != FR_OK) {
-					printf("f_close failed with code: %d\r\n", res);
-					return res;
+			// Else if Single Press, alternate between pausing and resuming
+			} else if (button_state == BUTTON_SINGLE_PRESS) {
+				if (play) {
+					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
+					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
+					play = !play;
+				} else {
+					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_1, (uint32_t*) ccr_l,
+									sizeof(ccr_l) / sizeof(ccr_l[0]));
+					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
+							sizeof(ccr_r) / sizeof(ccr_r[0]));
+					play = !play;
 				}
-
-				// Verify that we have read the entire data chunk upon unmount
-				printf("Bytes of data read: %lu bytes\r\n", data_bytes_read);
-				printf("Bytes of data actually there: %lu bytes \r\n",
-						data_size_dec);
-				printf("DATA chunk processed. Step 4 success.\r\n\n");
-
-				break;
+				waiting = 0;
+			// Else if Double press, skip song. Done by setting data_bytes_read to data_size_dec to force to end.
+			} else if (button_state == BUTTON_DOUBLE_PRESS) {
+				waiting = 0;
+				data_bytes_read = data_size_dec;
+			// Else if Long press, rewind song. Done by just resetting data_bytes_read and skip_data
+			} else if (button_state == BUTTON_LONG_PRESS) {
+				waiting = 0;
+				data_bytes_read = 0;
+				skip_data = data_start;
 			}
-
 		}
 	}
 	f_closedir(&dir);
 	sd_unmount();
 
 	HAL_Delay(1000);
-	/* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
-	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
-	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-	/** Configure the main internal regulator output voltage
-	 */
-	__HAL_RCC_PWR_CLK_ENABLE();
-	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-	/** Initializes the RCC Oscillators according to the specified parameters
-	 * in the RCC_OscInitTypeDef structure.
-	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-	RCC_OscInitStruct.PLL.PLLM = 4;
-	RCC_OscInitStruct.PLL.PLLN = 96;
-	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-	RCC_OscInitStruct.PLL.PLLQ = 4;
-	RCC_OscInitStruct.PLL.PLLR = 2;
-	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
-		Error_Handler();
-	}
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-	/** Initializes the CPU, AHB and APB buses clocks
-	 */
-	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) {
-		Error_Handler();
-	}
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
- * @brief SPI1 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_SPI1_Init(void) {
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
 
-	/* USER CODE BEGIN SPI1_Init 0 */
+  /* USER CODE BEGIN SPI1_Init 0 */
 
-	/* USER CODE END SPI1_Init 0 */
+  /* USER CODE END SPI1_Init 0 */
 
-	/* USER CODE BEGIN SPI1_Init 1 */
+  /* USER CODE BEGIN SPI1_Init 1 */
 
-	/* USER CODE END SPI1_Init 1 */
-	/* SPI1 parameter configuration*/
-	hspi1.Instance = SPI1;
-	hspi1.Init.Mode = SPI_MODE_MASTER;
-	hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-	hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-	hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-	hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-	hspi1.Init.NSS = SPI_NSS_SOFT;
-	hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
-	hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-	hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-	hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-	hspi1.Init.CRCPolynomial = 15;
-	if (HAL_SPI_Init(&hspi1) != HAL_OK) {
-		Error_Handler();
-	}
-	/* USER CODE BEGIN SPI1_Init 2 */
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 15;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
 
-	/* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
- * @brief TIM5 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_TIM5_Init(void) {
-
-	/* USER CODE BEGIN TIM5_Init 0 */
-
-	/* USER CODE END TIM5_Init 0 */
-
-	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
-	TIM_OC_InitTypeDef sConfigOC = { 0 };
-
-	/* USER CODE BEGIN TIM5_Init 1 */
-
-	/* USER CODE END TIM5_Init 1 */
-	htim5.Instance = TIM5;
-	htim5.Init.Prescaler = 1 - 1;
-	htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim5.Init.Period = 2000 - 1;
-	htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_PWM_Init(&htim5) != HAL_OK) {
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig)
-			!= HAL_OK) {
-		Error_Handler();
-	}
-	sConfigOC.OCMode = TIM_OCMODE_PWM1;
-	sConfigOC.Pulse = 0;
-	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-	if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1)
-			!= HAL_OK) {
-		Error_Handler();
-	}
-	if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2)
-			!= HAL_OK) {
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM5_Init 2 */
-
-	/* USER CODE END TIM5_Init 2 */
-	HAL_TIM_MspPostInit(&htim5);
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
-static void MX_USART2_UART_Init(void) {
+  * @brief TIM5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM5_Init(void)
+{
 
-	/* USER CODE BEGIN USART2_Init 0 */
+  /* USER CODE BEGIN TIM5_Init 0 */
 
-	/* USER CODE END USART2_Init 0 */
+  /* USER CODE END TIM5_Init 0 */
 
-	/* USER CODE BEGIN USART2_Init 1 */
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
-	/* USER CODE END USART2_Init 1 */
-	huart2.Instance = USART2;
-	huart2.Init.BaudRate = 115200;
-	huart2.Init.WordLength = UART_WORDLENGTH_8B;
-	huart2.Init.StopBits = UART_STOPBITS_1;
-	huart2.Init.Parity = UART_PARITY_NONE;
-	huart2.Init.Mode = UART_MODE_TX_RX;
-	huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart2) != HAL_OK) {
-		Error_Handler();
-	}
-	/* USER CODE BEGIN USART2_Init 2 */
+  /* USER CODE BEGIN TIM5_Init 1 */
 
-	/* USER CODE END USART2_Init 2 */
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 1-1;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 2000-1;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM5_Init 2 */
 
-}
-
-/**
- * Enable DMA controller clock
- */
-static void MX_DMA_Init(void) {
-
-	/* DMA controller clock enable */
-	__HAL_RCC_DMA2_CLK_ENABLE();
-	__HAL_RCC_DMA1_CLK_ENABLE();
-
-	/* DMA interrupt init */
-	/* DMA1_Stream2_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
-	/* DMA1_Stream4_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
-	/* DMA2_Stream2_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
-	/* DMA2_Stream3_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+  /* USER CODE END TIM5_Init 2 */
+  HAL_TIM_MspPostInit(&htim5);
 
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
-static void MX_GPIO_Init(void) {
-	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
-	/* USER CODE BEGIN MX_GPIO_Init_1 */
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
 
-	/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE BEGIN USART2_Init 0 */
 
-	/* GPIO Ports Clock Enable */
-	__HAL_RCC_GPIOH_CLK_ENABLE();
-	__HAL_RCC_GPIOA_CLK_ENABLE();
-	__HAL_RCC_GPIOB_CLK_ENABLE();
+  /* USER CODE END USART2_Init 0 */
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+  /* USER CODE BEGIN USART2_Init 1 */
 
-	/*Configure GPIO pin : SPI1_CS_Pin */
-	GPIO_InitStruct.Pin = SPI1_CS_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-	HAL_GPIO_Init(SPI1_CS_GPIO_Port, &GPIO_InitStruct);
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
 
-	/* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END USART2_Init 2 */
 
-	/* USER CODE END MX_GPIO_Init_2 */
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* DMA1_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI1_CS_Pin */
+  GPIO_InitStruct.Pin = SPI1_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(SPI1_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -949,16 +1070,17 @@ static void MX_GPIO_Init(void) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
-	/* USER CODE BEGIN Error_Handler_Debug */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
 	}
-	/* USER CODE END Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
