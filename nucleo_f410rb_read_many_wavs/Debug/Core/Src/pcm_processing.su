@@ -1,0 +1,3 @@
+../Core/Src/pcm_processing.c:29:9:pcm_le_signed32	24	static
+../Core/Src/pcm_processing.c:67:10:pcm_to_ccr	104	static
+../Core/Src/pcm_processing.c:88:6:process_pcm	96	static

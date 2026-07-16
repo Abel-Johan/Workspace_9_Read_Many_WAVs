@@ -1,0 +1,259 @@
+/*
+ * pcm_processing.c
+ *
+ *  Created on: 16 Jul 2026
+ *      Author: Nehemiah Abel Cavanaugh Johan
+ */
+
+#include <stdio.h>
+
+// Define a function to convert a little-endian (le) byte string into the correct integer representation
+static int32_t pcm_le_signed32(uint8_t *bufr, uint16_t bytes_per_sample_dec) {
+	// Case 8 bits sample depth. We can deal with converting unsigned 8 bit to signed 32 bit directly.
+	// We want it to actually be 32 bit signed
+	// Converting an unsigned to signed is simply a matter of shifting the offset
+	if (bytes_per_sample_dec == 1) {
+		return (int32_t) bufr[0] - 128;
+	}
+
+	// Initialise a return variable which will typecast to change later
+	// temp is not yet the PCM amplitude
+	// But the RETURNED value is the PCM amplitude
+	uint32_t temp = 0;
+
+	for (int k = 0; k < bytes_per_sample_dec; k++) {
+		// Left shift the bytes accordingly
+		temp |= (uint32_t) bufr[k] << (8 * k);
+	}
+
+	// Case 16 bits sample depth. Simply re-interpret the buffer contents as a 32 bit signed integer
+	if (bytes_per_sample_dec == 2) {
+		return (int32_t) (int16_t) temp;
+	}
+
+	// Case 24 bits sample depth. There is no int24_t so we have to do this manually
+	// Check if the sign bit is set in a would-have-been signed 24 bit representation
+	if (temp & 0x00800000) // 0x00800000 is 00000000 10000000 00000000 00000000
+			{
+		// If so, we simply ensure the most significant byte is full of 1 bits to get the correct signed 32 bit representation
+		temp |= 0xFF000000;
+	}
+
+	return (int32_t) temp;
+}
+
+// Define a function to convert PCM amplitude to CCR value. CCR/ARR = CCR/2000 is the duty cycle.
+// ARR defines the number of duty cycle levels available, and thus the resolution.
+// Since PWM frequency is 48 kHz, and it is given by f_pwm = (APB TIM1 Clock)/(Prescaler * ARR), ARR cannot be too big so 2000 is the highest practical limit
+// Hence only need to store CCR as a uint16_t.
+static uint32_t pcm_to_ccr(int32_t pcm_amp, const uint32_t ARR,
+		uint16_t bytes_per_sample_dec) {
+	// Find the maximum possible (signed) amplitude for each sample depth
+	int32_t max_amp = (1 << (bytes_per_sample_dec * 8 - 1)) - 1;
+
+	// A signed integer's range is [-(max_amp + 1), max_amp]
+	// So we need to shift it up to [0, 2*max_amp + 1], i.e. shift all upwards by max_amp + 1
+	int64_t centred_pcm_amp = (int64_t) pcm_amp + max_amp + 1;
+
+	// Finally, scale the centered_pcm_amp to the ARR
+	// CCR = centered_pcm_amp/(2*max_amp + 1) * ARR
+	int64_t ccr = (centred_pcm_amp * ARR) / (2 * max_amp + 1);
+
+	return (uint32_t) ccr;
+}
+
+// Define a function to repeatedly call to read PCM data from the SD card
+// When doing this, we cannot keep calling sd_wav_read because that function increases user readability but it's slow
+// It has to open and close the file each time it's called, which is not efficient
+// So for this, just have all the FATFS functions here in main.c
+// Have f_lseek and f_read in process_pcm, and f_open and f_close in main function
+static void process_pcm(uint8_t mode, const uint32_t ARR) {
+
+	uint32_t samples = 0; // Variable to store the number of PCM samples in the buffer to process
+	uint16_t sample_idx = 0; // Variable to store the current sample index among the data in the buffer array
+
+	// Ensure we are not near the end of the file yet
+	if ((data_bytes_read + (sizeof(bufr) / 2)) > data_size_dec) {
+		// Special case for reading the end of the file
+		uint32_t bytes_left = data_size_dec - data_bytes_read;
+
+		// If this happens when we are trying to edit the first half of the buffer and ccr's
+		if (mode == 1) {
+			// Only add audio data to the beginning parts of the buffer
+			res = f_lseek(&file, skip_data);
+
+			res = f_read(&file, bufr, bytes_left, &br);
+			if (res != FR_OK) {
+				printf("f_read failed with code: %d\r\n", res);
+				f_close(&file);
+				return;
+			}
+
+			data_bytes_read += bytes_left;
+			skip_data += bytes_left;
+
+			// But the end parts of the buffer still have data from the previous iteration
+			// So just replace them zeros
+			for (int i = bytes_left; i < (sizeof(bufr) / 2); i++) {
+				bufr[i] = 0;
+			}
+
+			samples = sizeof(bufr) / 2 / block_align_dec;
+
+			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
+
+			// The key is that in the buffer, element starts that are divisible by block align are left audio
+			// Element starts that are not divisible by block align are right audio
+			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
+
+			// Loop across each sample, joint between left and right
+			// i is the sample number
+			for (int i = 0; i < samples; i++) {
+				sample_idx = i * block_align_dec;
+
+				// Consider both the left and right samples
+				int32_t left = pcm_le_signed32(&bufr[sample_idx],
+						bytes_per_sample_dec);
+				int32_t right = pcm_le_signed32(
+						&bufr[sample_idx + bytes_per_sample_dec],
+						bytes_per_sample_dec);
+
+				// B. We then convert the PCM samples into CCR values
+				ccr_l[i] = pcm_to_ccr(left, ARR, bytes_per_sample_dec);
+				ccr_r[i] = pcm_to_ccr(right, ARR, bytes_per_sample_dec);
+			}
+		} else if (mode == 2) {
+			// Only add audio data to the beginning parts of the buffer
+			res = f_lseek(&file, skip_data);
+
+			res = f_read(&file, bufr + (sizeof(bufr) / 2), bytes_left, &br);
+			if (res != FR_OK) {
+				printf("f_read failed with code: %d\r\n", res);
+				f_close(&file);
+				return;
+			}
+
+			data_bytes_read += bytes_left;
+			skip_data += bytes_left;
+
+			// But the end parts of the buffer still have data from the previous iteration
+			// So just replace them zeros
+			for (int i = bytes_left; i < (sizeof(bufr) / 2); i++) {
+				bufr[i + (sizeof(bufr) / 2)] = 0;
+			}
+
+			samples = sizeof(bufr) / 2 / block_align_dec;
+
+			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
+
+			// The key is that in the buffer, element starts that are divisible by block align are left audio
+			// Element starts that are not divisible by block align are right audio
+			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
+
+			// Loop across each sample, joint between left and right
+			// i is the sample number
+			for (int i = 0; i < samples; i++) {
+				sample_idx = i * block_align_dec;
+
+				// Consider both the left and right samples
+				int32_t left = pcm_le_signed32(
+						&bufr[sample_idx] + (sizeof(bufr) / 2),
+						bytes_per_sample_dec);
+				int32_t right = pcm_le_signed32(
+						&bufr[sample_idx + bytes_per_sample_dec]
+								+ (sizeof(bufr) / 2), bytes_per_sample_dec);
+
+				// B. We then convert the PCM samples into CCR values
+				// + samples to only edit the second half
+				ccr_l[i + samples] = pcm_to_ccr(left, ARR,
+						bytes_per_sample_dec);
+				ccr_r[i + samples] = pcm_to_ccr(right, ARR,
+						bytes_per_sample_dec);
+			}
+		}
+	} else {
+		// Mode 1 = Case of wanting to replace the first half of the buffer, called by HalfCpltCallback or initial call
+		if (mode == 1) {
+			res = f_lseek(&file, skip_data);
+
+			res = f_read(&file, bufr, sizeof(bufr) / 2, &br);
+			if (res != FR_OK) {
+				printf("f_read failed with code: %d\r\n", res);
+				f_close(&file);
+				return;
+			}
+
+			data_bytes_read += sizeof(bufr) / 2;
+			skip_data += sizeof(bufr) / 2;
+
+			samples = sizeof(bufr) / 2 / block_align_dec;
+
+			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
+
+			// The key is that in the buffer, element starts that are divisible by block align are left audio
+			// Element starts that are not divisible by block align are right audio
+			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
+
+			// Loop across each sample, joint between left and right
+			// i is the sample number
+			for (int i = 0; i < samples; i++) {
+				sample_idx = i * block_align_dec;
+
+				// Consider both the left and right samples
+				int32_t left = pcm_le_signed32(&bufr[sample_idx],
+						bytes_per_sample_dec);
+				int32_t right = pcm_le_signed32(
+						&bufr[sample_idx + bytes_per_sample_dec],
+						bytes_per_sample_dec);
+
+				// B. We then convert the PCM samples into CCR values
+				ccr_l[i] = pcm_to_ccr(left, ARR, bytes_per_sample_dec);
+				ccr_r[i] = pcm_to_ccr(right, ARR, bytes_per_sample_dec);
+			}
+			// Mode 2 = Case of wanting to replace the second half of the buffer, called by CpltCallback or initial call
+		} else if (mode == 2) {
+			// + (sizeof(bufr)/2) to only edit the second half
+			res = f_lseek(&file, skip_data);
+
+			res = f_read(&file, bufr + (sizeof(bufr) / 2), sizeof(bufr) / 2,
+					&br);
+			if (res != FR_OK) {
+				printf("f_read failed with code: %d\r\n", res);
+				f_close(&file);
+				return;
+			}
+
+			data_bytes_read += sizeof(bufr) / 2;
+			skip_data += sizeof(bufr) / 2;
+
+			samples = sizeof(bufr) / 2 / block_align_dec;
+
+			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
+
+			// The key is that in the buffer, element starts that are divisible by block align are left audio
+			// Element starts that are not divisible by block align are right audio
+			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
+
+			// Loop across each sample, joint between left and right
+			// i is the sample number
+			for (int i = 0; i < samples; i++) {
+				sample_idx = i * block_align_dec;
+
+				// Consider both the left and right samples
+				int32_t left = pcm_le_signed32(
+						&bufr[sample_idx] + (sizeof(bufr) / 2),
+						bytes_per_sample_dec);
+				int32_t right = pcm_le_signed32(
+						&bufr[sample_idx + bytes_per_sample_dec]
+								+ (sizeof(bufr) / 2), bytes_per_sample_dec);
+
+				// B. We then convert the PCM samples into CCR values
+				// + samples to only edit the second half
+				ccr_l[i + samples] = pcm_to_ccr(left, ARR,
+						bytes_per_sample_dec);
+				ccr_r[i + samples] = pcm_to_ccr(right, ARR,
+						bytes_per_sample_dec);
+			}
+		}
+	}
+}

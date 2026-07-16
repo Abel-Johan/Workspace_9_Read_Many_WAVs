@@ -1,0 +1,16 @@
+/*
+ * pcm_processing.h
+ *
+ *  Created on: 16 Jul 2026
+ *      Author: Nehemiah Abel Cavanaugh Johan
+ */
+
+#ifndef INC_PCM_PROCESSING_H_
+#define INC_PCM_PROCESSING_H_
+
+int32_t pcm_le_signed32(uint8_t *bufr, uint16_t bytes_per_sample_dec);
+int32_t pcm_to_ccr(int32_t pcm_amp, const uint32_t ARR,
+		uint16_t bytes_per_sample_dec);
+void process_pcm(uint8_t mode, const uint32_t ARR);
+
+#endif /* INC_PCM_PROCESSING_H_ */

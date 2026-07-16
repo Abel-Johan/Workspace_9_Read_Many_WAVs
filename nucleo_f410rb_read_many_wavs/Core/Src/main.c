@@ -37,8 +37,9 @@
 #include "sd_functions.h"
 #include "sd_spi.h"
 
-// Functions to repeatedly call when parsing WAV file
+// Files specific to this program
 #include "sd_wav.h"
+#include "pcm_processing.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,11 +69,14 @@ DMA_HandleTypeDef hdma_tim5_ch2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint8_t riff_header_chunk[12];
+uint8_t riff_header_chunk[12]; // Array to store RIFF chunk contents
 
-uint8_t chunk_id[4];
+// Arrays to temporarily store the chunk ID and size for each chunk we analyse
+uint8_t chunk_id[4];   // Array to store chunk ID/chunk "name"
 uint8_t chunk_size[4]; // Array to store chunk size in little-endian mode
 
+
+/* Variables relating to the parameters of the audio file start */
 // Decimal representations
 uint32_t file_size_dec;    	   // Total file size
 uint32_t fmt_size_dec;         // fmt chunk size
@@ -85,46 +89,61 @@ uint16_t block_align_dec;      // Block align
 uint16_t bytes_per_sample_dec; // Bytes per sample = sample depth / 8
 
 // Binary representations
-uint8_t audio_fmt[2];
-uint8_t channels[2];
-uint8_t sample_rate[4];
-uint8_t byte_rate[4];
-uint8_t block_align[2];
-uint8_t sample_depth[2];
+uint8_t audio_fmt[2];    // Audio format
+uint8_t channels[2];     // Number of channels
+uint8_t sample_rate[4];  // Sample rate
+uint8_t byte_rate[4];    // Byte rate
+uint8_t block_align[2];  // Block align
+uint8_t sample_depth[2]; // Sample depth (in bits)
+/* Variables relating to the parameters of the audio file end */
 
-// Expected binary representations for an uncompressed PCM WAV file that we consider
-const uint8_t exp_fmt[4] = { 0x66, 0x6D, 0x74, 0x20 };    // "fmt "
-const uint8_t exp_data[4] = { 0x64, 0x61, 0x74, 0x61 };   // "data"
-const uint32_t exp_fmt_sz_dec = 16;                  // 16 for standard PCM WAV
-const uint8_t exp_audio_fmt[2] = { 0x01, 0x00 };       // 1 for standard PCM WAV
-const uint8_t stereo[2] = { 0x02, 0x00 };                 // 2 for stereo
 
-uint8_t bufr[8192]; // Array to store PCM data immediately from SD card, give 8 KiB = 8192 B of space
+// Expected values necessary for an uncompressed WAV file.
+const uint8_t exp_fmt[4] = { 0x66, 0x6D, 0x74, 0x20 };  // "fmt "
+const uint8_t exp_data[4] = { 0x64, 0x61, 0x74, 0x61 }; // "data"
+const uint32_t exp_fmt_sz_dec = 16;                     // 16 for standard PCM WAV
+const uint8_t exp_audio_fmt[2] = { 0x01, 0x00 };        // 1 for standard PCM WAV
+const uint8_t stereo[2] = { 0x02, 0x00 };               // 2 for stereo
+
+
+// Variables to use as we increment along the audio data in a WAV file
+uint32_t data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
+uint32_t skip = 12;           // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
+uint32_t skip_fmt = 0;        // skip variable to record down and increment the start of the fmt chunk's useful data
+uint32_t skip_data = 0;       // skip variable to record down and increment the start of the data chunk's useful data
+uint32_t data_start;          // Variable to record down to start of the audio data.
+
+
+// Buffers and storage spaces to store raw or processed data
+uint8_t bufr[8192];   // Array to store PCM data immediately from SD card, give 8 KiB = 8192 B of space
 uint32_t ccr_l[2048]; // Array to store CCR values for left channel. The PWM function requires CCR to be a 32-bit integer to work properly.
 uint32_t ccr_r[2048]; // Array to store CCR values for right channel. The PWM function requires CCR to be a 32-bit integer to work properly.
-uint32_t data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
-uint32_t skip = 12; // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
-uint32_t skip_fmt = 0; // skip variable to record down and increment the start of the fmt chunk's useful data
-uint32_t skip_data = 0; // skip variable to record down and increment the start of the data chunk's useful data
-uint32_t ARR; // Variable to store ARR value
-uint32_t data_start; // Variable to record down to start of the audio data.
 
-UINT br; // Variable to store bytes read for use when reading files
 
-FIL file; // File variable
-FRESULT res; // Result of file operations with FATFS. Mostly useful for debugging.
-extern char sd_path[4];
+// Variables for use by FATFS
+FIL file;               // File variable
+FRESULT res;            // Result of file operations with FATFS. Mostly useful for debugging.
+extern char sd_path[4]; // Array to store the path to the SD card. This will usually be "0:/". The fourth character is the null-terminator \0
 
+
+// Variables for button functionality
 const uint32_t DEBOUNCE_TIME = 20; // Ignore rogue button bounces, this is the time in ms to ignore successive button presses
-const uint32_t SUCCESSIVE_BUTTON_PRESS_TIME = 600; // Wait for this amount of time before deciding between single or double press
+const uint32_t SUCCESSIVE_BUTTON_PRESS_TIME = 750; // Wait for this amount of time before deciding between single or double press
 
 volatile uint8_t previous_state; // Boolean variable to store the previous state of the button
-volatile uint8_t pressed; // Boolean variable to store current state of button. pressed = 1, released = 0
-volatile uint8_t waiting; // Boolean variable to store the state of whether we are waiting for a second button press or not
-volatile uint32_t press_time; // Tick of button press
-volatile uint32_t release_time; // Tick of button release
-volatile uint8_t play = 1; // Boolean variable to store whether to play or not (play vs pause/stop)
+volatile uint8_t pressed;        // Boolean variable to store current state of button. pressed = 1, released = 0
+volatile uint8_t waiting;        // Boolean variable to store the state of whether we are waiting for a second button press or not
+volatile uint32_t press_time;    // Tick of button press
+volatile uint32_t release_time;  // Tick of button release
+volatile uint8_t play = 1;       // Boolean variable to store whether to play or not (play vs pause/stop)
 
+
+// Miscellaneous variables
+uint32_t ARR; // Variable to store ARR value
+UINT br;      // Variable to store bytes read for use when reading files
+
+
+/* Enumerations start */
 // Define an enumeration variable which will tell the code to refill the first or second half of the bufr/ccr array.
 // refill_request needs to be volatile because it will be accessed by the interrupt
 // This prevents the compiler from trying to cache refill_request in order to "optimise speed"
@@ -142,6 +161,7 @@ enum button_t {
 };
 
 volatile enum button_t button_state = BUTTON_IDLE;
+/* Enumerations end */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -158,6 +178,7 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 // Define a custom function to print to the console via UART
+// This allows us to use printf to transmit via UART instead of doing HAL_UART_Transmit all the time
 int _write(int fd, unsigned char *buf, int len) {
 	if (fd == 1 || fd == 2) {                     // stdout or stderr ?
 		HAL_UART_Transmit(&huart2, buf, len, 999);  // Print to the UART
@@ -178,258 +199,8 @@ static uint8_t has_wav_extension(char *name) {
 	tolower((unsigned char)dot[3]) == 'v' && dot[4] == '\0');
 }
 
-// Define a function to convert a little-endian (le) byte string into the correct integer representation
-static int32_t pcm_le_signed32(uint8_t *bufr, uint16_t bytes_per_sample_dec) {
-	// Case 8 bits sample depth. We can deal with converting unsigned 8 bit to signed 32 bit directly.
-	// We want it to actually be 32 bit signed
-	// Converting an unsigned to signed is simply a matter of shifting the offset
-	if (bytes_per_sample_dec == 1) {
-		return (int32_t) bufr[0] - 128;
-	}
-
-	// Initialise a return variable which will typecast to change later
-	// temp is not yet the PCM amplitude
-	// But the RETURNED value is the PCM amplitude
-	uint32_t temp = 0;
-
-	for (int k = 0; k < bytes_per_sample_dec; k++) {
-		// Left shift the bytes accordingly
-		temp |= (uint32_t) bufr[k] << (8 * k);
-	}
-
-	// Case 16 bits sample depth. Simply re-interpret the buffer contents as a 32 bit signed integer
-	if (bytes_per_sample_dec == 2) {
-		return (int32_t) (int16_t) temp;
-	}
-
-	// Case 24 bits sample depth. There is no int24_t so we have to do this manually
-	// Check if the sign bit is set in a would-have-been signed 24 bit representation
-	if (temp & 0x00800000) // 0x00800000 is 00000000 10000000 00000000 00000000
-			{
-		// If so, we simply ensure the most significant byte is full of 1 bits to get the correct signed 32 bit representation
-		temp |= 0xFF000000;
-	}
-
-	return (int32_t) temp;
-}
-
-// Define a function to convert PCM amplitude to CCR value. CCR/ARR = CCR/2000 is the duty cycle.
-// ARR defines the number of duty cycle levels available, and thus the resolution.
-// Since PWM frequency is 48 kHz, and it is given by f_pwm = (APB TIM1 Clock)/(Prescaler * ARR), ARR cannot be too big so 2000 is the highest practical limit
-// Hence only need to store CCR as a uint16_t.
-static uint32_t pcm_to_ccr(int32_t pcm_amp, const uint32_t ARR,
-		uint16_t bytes_per_sample_dec) {
-	// Find the maximum possible (signed) amplitude for each sample depth
-	int32_t max_amp = (1 << (bytes_per_sample_dec * 8 - 1)) - 1;
-
-	// A signed integer's range is [-(max_amp + 1), max_amp]
-	// So we need to shift it up to [0, 2*max_amp + 1], i.e. shift all upwards by max_amp + 1
-	int64_t centred_pcm_amp = (int64_t) pcm_amp + max_amp + 1;
-
-	// Finally, scale the centered_pcm_amp to the ARR
-	// CCR = centered_pcm_amp/(2*max_amp + 1) * ARR
-	int64_t ccr = (centred_pcm_amp * ARR) / (2 * max_amp + 1);
-
-	return (uint32_t) ccr;
-}
-
-// Define a function to repeatedly call to read PCM data from the SD card
-// When doing this, we cannot keep calling sd_wav_read because that function increases user readability but it's slow
-// It has to open and close the file each time it's called, which is not efficient
-// So for this, just have all the FATFS functions here in main.c
-// Have f_lseek and f_read in process_pcm, and f_open and f_close in main function
-static void process_pcm(uint8_t mode, const uint32_t ARR) {
-
-	uint32_t samples = 0; // Variable to store the number of PCM samples in the buffer to process
-	uint16_t sample_idx = 0; // Variable to store the current sample index among the data in the buffer array
-
-	// Ensure we are not near the end of the file yet
-	if ((data_bytes_read + (sizeof(bufr) / 2)) > data_size_dec) {
-		// Special case for reading the end of the file
-		uint32_t bytes_left = data_size_dec - data_bytes_read;
-
-		// If this happens when we are trying to edit the first half of the buffer and ccr's
-		if (mode == 1) {
-			// Only add audio data to the beginning parts of the buffer
-			res = f_lseek(&file, skip_data);
-
-			res = f_read(&file, bufr, bytes_left, &br);
-			if (res != FR_OK) {
-				printf("f_read failed with code: %d\r\n", res);
-				f_close(&file);
-				return;
-			}
-
-			data_bytes_read += bytes_left;
-			skip_data += bytes_left;
-
-			// But the end parts of the buffer still have data from the previous iteration
-			// So just replace them zeros
-			for (int i = bytes_left; i < (sizeof(bufr) / 2); i++) {
-				bufr[i] = 0;
-			}
-
-			samples = sizeof(bufr) / 2 / block_align_dec;
-
-			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
-
-			// The key is that in the buffer, element starts that are divisible by block align are left audio
-			// Element starts that are not divisible by block align are right audio
-			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
-
-			// Loop across each sample, joint between left and right
-			// i is the sample number
-			for (int i = 0; i < samples; i++) {
-				sample_idx = i * block_align_dec;
-
-				// Consider both the left and right samples
-				int32_t left = pcm_le_signed32(&bufr[sample_idx],
-						bytes_per_sample_dec);
-				int32_t right = pcm_le_signed32(
-						&bufr[sample_idx + bytes_per_sample_dec],
-						bytes_per_sample_dec);
-
-				// B. We then convert the PCM samples into CCR values
-				ccr_l[i] = pcm_to_ccr(left, ARR, bytes_per_sample_dec);
-				ccr_r[i] = pcm_to_ccr(right, ARR, bytes_per_sample_dec);
-			}
-		} else if (mode == 2) {
-			// Only add audio data to the beginning parts of the buffer
-			res = f_lseek(&file, skip_data);
-
-			res = f_read(&file, bufr + (sizeof(bufr) / 2), bytes_left, &br);
-			if (res != FR_OK) {
-				printf("f_read failed with code: %d\r\n", res);
-				f_close(&file);
-				return;
-			}
-
-			data_bytes_read += bytes_left;
-			skip_data += bytes_left;
-
-			// But the end parts of the buffer still have data from the previous iteration
-			// So just replace them zeros
-			for (int i = bytes_left; i < (sizeof(bufr) / 2); i++) {
-				bufr[i + (sizeof(bufr) / 2)] = 0;
-			}
-
-			samples = sizeof(bufr) / 2 / block_align_dec;
-
-			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
-
-			// The key is that in the buffer, element starts that are divisible by block align are left audio
-			// Element starts that are not divisible by block align are right audio
-			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
-
-			// Loop across each sample, joint between left and right
-			// i is the sample number
-			for (int i = 0; i < samples; i++) {
-				sample_idx = i * block_align_dec;
-
-				// Consider both the left and right samples
-				int32_t left = pcm_le_signed32(
-						&bufr[sample_idx] + (sizeof(bufr) / 2),
-						bytes_per_sample_dec);
-				int32_t right = pcm_le_signed32(
-						&bufr[sample_idx + bytes_per_sample_dec]
-								+ (sizeof(bufr) / 2), bytes_per_sample_dec);
-
-				// B. We then convert the PCM samples into CCR values
-				// + samples to only edit the second half
-				ccr_l[i + samples] = pcm_to_ccr(left, ARR,
-						bytes_per_sample_dec);
-				ccr_r[i + samples] = pcm_to_ccr(right, ARR,
-						bytes_per_sample_dec);
-			}
-		}
-	} else {
-		// Mode 1 = Case of wanting to replace the first half of the buffer, called by HalfCpltCallback or initial call
-		if (mode == 1) {
-			res = f_lseek(&file, skip_data);
-
-			res = f_read(&file, bufr, sizeof(bufr) / 2, &br);
-			if (res != FR_OK) {
-				printf("f_read failed with code: %d\r\n", res);
-				f_close(&file);
-				return;
-			}
-
-			data_bytes_read += sizeof(bufr) / 2;
-			skip_data += sizeof(bufr) / 2;
-
-			samples = sizeof(bufr) / 2 / block_align_dec;
-
-			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
-
-			// The key is that in the buffer, element starts that are divisible by block align are left audio
-			// Element starts that are not divisible by block align are right audio
-			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
-
-			// Loop across each sample, joint between left and right
-			// i is the sample number
-			for (int i = 0; i < samples; i++) {
-				sample_idx = i * block_align_dec;
-
-				// Consider both the left and right samples
-				int32_t left = pcm_le_signed32(&bufr[sample_idx],
-						bytes_per_sample_dec);
-				int32_t right = pcm_le_signed32(
-						&bufr[sample_idx + bytes_per_sample_dec],
-						bytes_per_sample_dec);
-
-				// B. We then convert the PCM samples into CCR values
-				ccr_l[i] = pcm_to_ccr(left, ARR, bytes_per_sample_dec);
-				ccr_r[i] = pcm_to_ccr(right, ARR, bytes_per_sample_dec);
-			}
-			// Mode 2 = Case of wanting to replace the second half of the buffer, called by CpltCallback or initial call
-		} else if (mode == 2) {
-			// + (sizeof(bufr)/2) to only edit the second half
-			res = f_lseek(&file, skip_data);
-
-			res = f_read(&file, bufr + (sizeof(bufr) / 2), sizeof(bufr) / 2,
-					&br);
-			if (res != FR_OK) {
-				printf("f_read failed with code: %d\r\n", res);
-				f_close(&file);
-				return;
-			}
-
-			data_bytes_read += sizeof(bufr) / 2;
-			skip_data += sizeof(bufr) / 2;
-
-			samples = sizeof(bufr) / 2 / block_align_dec;
-
-			// We first convert each set of <no. of channels * sample depth> bytes into one (signed) integer representing a mono audio voltage
-
-			// The key is that in the buffer, element starts that are divisible by block align are left audio
-			// Element starts that are not divisible by block align are right audio
-			// And then of course, bear in mind the sample depth which determines how many bytes/elements to encode one left/right sample
-
-			// Loop across each sample, joint between left and right
-			// i is the sample number
-			for (int i = 0; i < samples; i++) {
-				sample_idx = i * block_align_dec;
-
-				// Consider both the left and right samples
-				int32_t left = pcm_le_signed32(
-						&bufr[sample_idx] + (sizeof(bufr) / 2),
-						bytes_per_sample_dec);
-				int32_t right = pcm_le_signed32(
-						&bufr[sample_idx + bytes_per_sample_dec]
-								+ (sizeof(bufr) / 2), bytes_per_sample_dec);
-
-				// B. We then convert the PCM samples into CCR values
-				// + samples to only edit the second half
-				ccr_l[i + samples] = pcm_to_ccr(left, ARR,
-						bytes_per_sample_dec);
-				ccr_r[i + samples] = pcm_to_ccr(right, ARR,
-						bytes_per_sample_dec);
-			}
-		}
-	}
-}
-
 // Called by main either if button interrupt or waiting is true
+// Determines whether a button is a short single, long single, or double press
 enum button_t process_button(void) {
 	uint32_t now = HAL_GetTick();
 	enum button_t button_event = BUTTON_IDLE;
@@ -471,7 +242,6 @@ void HAL_TIM_PWM_PulseFinishedHalfCpltCallback(TIM_HandleTypeDef *htim) {
 	if (htim->Instance == TIM5 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
 		refill_request = REFILL_FIRST;
 	}
-
 }
 
 // Function called when all of the array, and therefore the second half of the array, has been transmitted to PWM
@@ -550,10 +320,9 @@ int main(void)
 	// 0. Mount SD card
 	sd_mount();
 
-	// 1a. Prepare to read Music folder
+	// 1a. Open the Music folder
 	DIR dir;
 	FILINFO fno;
-	FRESULT res;
 
 	res = f_opendir(&dir, "Music");
 	if (res != FR_OK) {
@@ -566,10 +335,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
 	// 1b. For every WAV file in Music folder:
 	while (1) {
+		// Hard-reset the variables we use to increment
 		data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
-		skip = 12; // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
-		skip_fmt = 0; // skip variable to record down the start of the fmt chunk's useful data
-		skip_data = 0; // skip variable to record down the start of the data chunk's useful data
+		skip = 12;           // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
+		skip_fmt = 0;        // skip variable to record down the start of the fmt chunk's useful data
+		skip_data = 0;       // skip variable to record down the start of the data chunk's useful data
 
 		char fullname[256] = "Music/";
 		res = f_readdir(&dir, &fno);
@@ -593,13 +363,15 @@ int main(void)
 			continue; // skip
 		}
 
+		// Get the full name of the file, which is "Music/<filename>.wav"
 		strcat(fullname, name);
+
 		// 2. Initialise reading wav file
 		// Read first 12 bytes.
 		sd_wav_init(fullname, riff_header_chunk, sizeof(riff_header_chunk),
 				&br);
 
-		// Ensure it is RIFF....WAVE
+		// Ensure it is RIFFxxxxWAVE
 		// Because array slicing doesn't exist in C, it is a hassle to use memcmp to verify the riff_header_chunk contents
 		// So just use "brute force"
 		if (riff_header_chunk[0] != 0x52 || // R
@@ -613,16 +385,14 @@ int main(void)
 						{
 			printf("Only .wav files permitted.\r\n");
 			return 2;
-		} else
-			printf("Valid .wav file. Step 0 success.\r\n\n");
+		}
 
 		// 3. Determine the file size. This is useful to compare against the skip variable later to know when we reach file end
 		// File size in bytes is the elements 4 through 7 of riff_header_chunk, in little-endian mode, plus 8.
 		file_size_dec = (((uint32_t) riff_header_chunk[4])
 				| ((uint32_t) riff_header_chunk[5] << 8)
 				| ((uint32_t) riff_header_chunk[6] << 16)
-				| ((uint32_t) riff_header_chunk[7] << 24)) + 8;
-		printf("File size determined. Step 1 success.\r\n\n");
+				| ((uint32_t) riff_header_chunk[7] << 24)) + 8; // Little-endian: the first byte is actually the least significant byte!
 
 		ARR = __HAL_TIM_GET_AUTORELOAD(&htim5);
 
@@ -638,37 +408,33 @@ int main(void)
 			chunk_size_dec = ((uint32_t) chunk_size[0])
 					| ((uint32_t) chunk_size[1] << 8)
 					| ((uint32_t) chunk_size[2] << 16)
-					| ((uint32_t) chunk_size[3] << 24); // Little-endian: the first byte is actually the least significant byte!
+					| ((uint32_t) chunk_size[3] << 24);
 
 			// Detect where the fmt chunk is
 			if (memcmp(chunk_id, exp_fmt, (int) sizeof(exp_fmt)) == 0) {
-				printf("Found FORMAT chunk.\r\n");
 				skip_fmt = skip;
 				fmt_size_dec = chunk_size_dec;
 			}
 			// Detect where the data chunk is
 			else if (memcmp(chunk_id, exp_data, (int) sizeof(exp_data)) == 0) {
-				printf("Found DATA chunk.\r\n");
 				skip_data = skip;
 				data_start = skip;
 				data_size_dec = chunk_size_dec;
 			}
-			// Skip any other chunk
+			// Ignore any other chunk
 			else {
 				printf("Skipped %4s chunk.\r\n", chunk_id);
 			}
-
+			// Skip to end of this chunk
 			skip += chunk_size_dec;
 
+			// We are finished if we've detected where the fmt and data chunk are.
 			if ((skip_fmt != 0) && (skip_data != 0)) {
-				printf("Relevant chunks detected. Step 2 success.\r\n\n");
 				break;
 			}
 		}
 
 		// 5. Process the fmt chunk
-		printf("Processing FORMAT chunk...\r\n");
-
 		// Verify chunk size = 16 for PCM WAV (i.e., standard, uncompressed PCM WAV)
 		if (fmt_size_dec != exp_fmt_sz_dec) {
 			printf("Given .wav file not standard PCM.\r\n");
@@ -728,13 +494,10 @@ int main(void)
 					bytes_per_sample_dec);
 			return 6;
 		}
-
 		// Finish processing fmt chunk
-		printf("FORMAT chunk processed. Step 3 success.\r\n\n");
+
 
 		// 6. Process the data chunk
-		printf("Processing DATA chunk...\r\n");
-
 		// 6a. Open the file
 		FRESULT res = f_open(&file, fullname, FA_READ);
 		if (res != FR_OK) {
@@ -748,8 +511,11 @@ int main(void)
 		// Fill second half of ccr's
 		process_pcm(2, ARR);
 
-		// 6c. Send to PWM
-		// Actually, if audio was stereo to begin with, you'll only use half of the CCR array
+		// 6c. Start sending to PWM
+		// Remember duty cycle = CCR/ARR for each channel at each instance of time.
+		// Direct memory access (DMA) allows us to send/receive data without involving the CPU
+		// So the CPU can focus on refilling the CCR's for the next package of data.
+		// DMA is in Circular mode which means it repeatedly sends PWM signals, as if in a very efficient while loop
 		HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_1, (uint32_t*) ccr_l,
 				sizeof(ccr_l) / sizeof(ccr_l[0]));
 		HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
@@ -757,6 +523,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+		// 6d. Repeat until we reach end of the data chunk.
 		while (1) {
 			button_state = process_button();
 
@@ -778,6 +545,7 @@ int main(void)
 						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
 						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
 
+						// Remember to close the file
 						res = f_close(&file);
 						if (res != FR_OK) {
 							printf("f_close failed with code: %d\r\n", res);
@@ -796,10 +564,12 @@ int main(void)
 			// Else if Single Press, alternate between pausing and resuming
 			} else if (button_state == BUTTON_SINGLE_PRESS) {
 				if (play) {
+					printf("Single press. Pausing.\r\n");
 					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
 					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
 					play = !play;
 				} else {
+					printf("Single press. Resuming.\r\n");
 					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_1, (uint32_t*) ccr_l,
 									sizeof(ccr_l) / sizeof(ccr_l[0]));
 					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
@@ -809,20 +579,23 @@ int main(void)
 				waiting = 0;
 			// Else if Double press, skip song. Done by setting data_bytes_read to data_size_dec to force to end.
 			} else if (button_state == BUTTON_DOUBLE_PRESS) {
+				printf("Double press. Skipping.\r\n");
 				waiting = 0;
 				data_bytes_read = data_size_dec;
 			// Else if Long press, rewind song. Done by just resetting data_bytes_read and skip_data
 			} else if (button_state == BUTTON_LONG_PRESS) {
+				printf("Long press. Rewinding.\r\n");
 				waiting = 0;
 				data_bytes_read = 0;
 				skip_data = data_start;
 			}
 		}
+		// 1 second delay between songs
+		HAL_Delay(1000);
 	}
+	// Remember to close the Music folder and unmount the SD card upon finishing
 	f_closedir(&dir);
 	sd_unmount();
-
-	HAL_Delay(1000);
   /* USER CODE END 3 */
 }
 

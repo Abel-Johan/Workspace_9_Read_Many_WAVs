@@ -1,0 +1,844 @@
+/* USER CODE BEGIN Header */
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "fatfs.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+// Standard libraries
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+// FATFS module from ELM by ChaN
+#include "ff.h"
+#include "ffconf.h"
+
+// SD card interfacing module by ControllersTech
+#include "sd_diskio_spi.h"
+#include "sd_functions.h"
+#include "sd_spi.h"
+
+// Files specific to this program
+#include "sd_wav.h"
+#include "pcm_processing.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_rx;
+DMA_HandleTypeDef hdma_spi1_tx;
+
+TIM_HandleTypeDef htim5;
+DMA_HandleTypeDef hdma_tim5_ch1;
+DMA_HandleTypeDef hdma_tim5_ch2;
+
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+uint8_t riff_header_chunk[12]; // Array to store RIFF chunk contents
+
+/* Arrays to temporarily store the chunk ID and size for each chunk we analyse */
+uint8_t chunk_id[4];   // Array to store chunk ID/chunk "name"
+uint8_t chunk_size[4]; // Array to store chunk size in little-endian mode
+
+
+/* Variables relating to the parameters of the audio file start */
+// Decimal representations
+uint32_t file_size_dec;    	   // Total file size
+uint32_t fmt_size_dec;         // fmt chunk size
+uint32_t data_size_dec;        // data chunk size
+uint32_t chunk_size_dec;       // Chunk size
+uint16_t channels_dec;         // Number of channels
+uint32_t sample_rate_dec;      // Sample rate
+uint32_t byte_rate_dec;        // Byte rate
+uint16_t block_align_dec;      // Block align
+uint16_t bytes_per_sample_dec; // Bytes per sample = sample depth / 8
+
+// Binary representations
+uint8_t audio_fmt[2];    // Audio format
+uint8_t channels[2];     // Number of channels
+uint8_t sample_rate[4];  // Sample rate
+uint8_t byte_rate[4];    // Byte rate
+uint8_t block_align[2];  // Block align
+uint8_t sample_depth[2]; // Sample depth (in bits)
+/* Variables relating to the parameters of the audio file end */
+
+
+// Expected binary representations for an uncompressed PCM WAV file that we consider
+const uint8_t exp_fmt[4] = { 0x66, 0x6D, 0x74, 0x20 };    // "fmt "
+const uint8_t exp_data[4] = { 0x64, 0x61, 0x74, 0x61 };   // "data"
+const uint32_t exp_fmt_sz_dec = 16;                  // 16 for standard PCM WAV
+const uint8_t exp_audio_fmt[2] = { 0x01, 0x00 };       // 1 for standard PCM WAV
+const uint8_t stereo[2] = { 0x02, 0x00 };                 // 2 for stereo
+
+uint8_t bufr[8192]; // Array to store PCM data immediately from SD card, give 8 KiB = 8192 B of space
+uint32_t ccr_l[2048]; // Array to store CCR values for left channel. The PWM function requires CCR to be a 32-bit integer to work properly.
+uint32_t ccr_r[2048]; // Array to store CCR values for right channel. The PWM function requires CCR to be a 32-bit integer to work properly.
+uint32_t data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
+uint32_t skip = 12; // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
+uint32_t skip_fmt = 0; // skip variable to record down and increment the start of the fmt chunk's useful data
+uint32_t skip_data = 0; // skip variable to record down and increment the start of the data chunk's useful data
+uint32_t ARR; // Variable to store ARR value
+uint32_t data_start; // Variable to record down to start of the audio data.
+
+UINT br; // Variable to store bytes read for use when reading files
+
+FIL file; // File variable
+FRESULT res; // Result of file operations with FATFS. Mostly useful for debugging.
+extern char sd_path[4];
+
+const uint32_t DEBOUNCE_TIME = 20; // Ignore rogue button bounces, this is the time in ms to ignore successive button presses
+const uint32_t SUCCESSIVE_BUTTON_PRESS_TIME = 600; // Wait for this amount of time before deciding between single or double press
+
+volatile uint8_t previous_state; // Boolean variable to store the previous state of the button
+volatile uint8_t pressed; // Boolean variable to store current state of button. pressed = 1, released = 0
+volatile uint8_t waiting; // Boolean variable to store the state of whether we are waiting for a second button press or not
+volatile uint32_t press_time; // Tick of button press
+volatile uint32_t release_time; // Tick of button release
+volatile uint8_t play = 1; // Boolean variable to store whether to play or not (play vs pause/stop)
+
+// Define an enumeration variable which will tell the code to refill the first or second half of the bufr/ccr array.
+// refill_request needs to be volatile because it will be accessed by the interrupt
+// This prevents the compiler from trying to cache refill_request in order to "optimise speed"
+// volatile forces the compiler to check the original memory location whenever we need refill_request instead of caching it.
+enum refill_t {
+	REFILL_NONE, REFILL_FIRST, REFILL_SECOND
+};
+
+volatile enum refill_t refill_request = REFILL_NONE;
+
+// Define an enumeration variable which will tell the code to pause/resume, skip, or rewind based on button press
+// As above, button_request needs to be volatile
+enum button_t {
+	BUTTON_IDLE, BUTTON_SINGLE_PRESS, BUTTON_DOUBLE_PRESS, BUTTON_LONG_PRESS
+};
+
+volatile enum button_t button_state = BUTTON_IDLE;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_TIM5_Init(void);
+static void MX_USART2_UART_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// Define a custom function to print to the console via UART
+int _write(int fd, unsigned char *buf, int len) {
+	if (fd == 1 || fd == 2) {                     // stdout or stderr ?
+		HAL_UART_Transmit(&huart2, buf, len, 999);  // Print to the UART
+	}
+	return len;
+}
+
+// Define a function to determine whether a file is .wav or not
+static uint8_t has_wav_extension(char *name) {
+	// Find position of dot
+	const char *dot = strrchr(name, '.');
+	// Case of file has no dot/no extension
+	if (!dot)
+		return 0;
+
+	return (tolower((unsigned char)dot[1]) == 'w' &&
+	tolower((unsigned char)dot[2]) == 'a' &&
+	tolower((unsigned char)dot[3]) == 'v' && dot[4] == '\0');
+}
+
+// Called by main either if button interrupt or waiting is true
+enum button_t process_button(void) {
+	uint32_t now = HAL_GetTick();
+	enum button_t button_event = BUTTON_IDLE;
+
+	// If button is pressed (doesn't matter if it is first or second press)
+	// Need both because we are considering an edge, not just the value itself.
+	if (pressed && !previous_state) {
+		press_time = now;
+	// Else if button was released the first time
+	// Need both because we are considering an edge, not just the value itself.
+	} else if (!pressed && previous_state) {
+		release_time = now;
+
+		if (release_time - press_time >= SUCCESSIVE_BUTTON_PRESS_TIME) {
+			waiting = 0;
+			button_event = BUTTON_LONG_PRESS;
+		}
+		// Else if button was released the second time
+		else if (waiting) {
+			waiting = 0;
+			button_event = BUTTON_DOUBLE_PRESS;
+		} else {
+		waiting = 1;
+		}
+	}
+
+	// Separately, if it's been 500 ms since the first button release, and the button is not pressed at the moment
+	if (waiting && !pressed & ((now - release_time) >= SUCCESSIVE_BUTTON_PRESS_TIME)) {
+		waiting = 0;
+		button_event = BUTTON_SINGLE_PRESS;
+	}
+	previous_state = pressed;
+	return button_event;
+}
+
+// Function called when first half of the array has been transmitted to PWM
+// We thus need to change the contents of the first half of the buffer and ccr
+void HAL_TIM_PWM_PulseFinishedHalfCpltCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM5 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+		refill_request = REFILL_FIRST;
+	}
+
+}
+
+// Function called when all of the array, and therefore the second half of the array, has been transmitted to PWM
+// We thus need to change the contents of the second half of the buffer and ccr
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM5 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+		refill_request = REFILL_SECOND;
+	}
+}
+
+// Function called when an External Interrupt event happens. In this case, the blue button being pushed
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	if (GPIO_Pin == GPIO_PIN_13) {
+		uint32_t now = HAL_GetTick();
+
+		if ((now - release_time) > DEBOUNCE_TIME) {
+			// Button is active-low due to a pull-up resistor. So when pin is 1, button is actually not pressed/pressed = 0.
+			pressed = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET);
+		}
+	}
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_SPI1_Init();
+  MX_TIM5_Init();
+  MX_USART2_UART_Init();
+//  MX_FATFS_Init();
+  /* USER CODE BEGIN 2 */
+	// This is where we change the Baud Rate Prescaler to make the SD card read/write speed faster
+	// Temporarily disable the SPI if we want to change the baud rate
+	__HAL_SPI_DISABLE(&hspi1);
+
+	// Reduce the prescaler to increase the baud rate
+	// If we want to send PWM signals at 48 kHz (which is equal to the sample rate)
+	// And if one sample is 4 bytes (2 bytes for left and 2 bytes for right channel)
+	// Then we need to read the SD card at an SPI baud rate of 192 KBps = 1.536 Mbps
+	// Since SPI1 takes clock from APB2 which is 96 MHz/96 Mbps, the maximum prescaler according to APB2/prescaler = SPI baud rate
+	// is 62.5. So we can have at most prescaler of 32.
+	// However, this isn't exactly linear as there is also the time needed to tell the SD card that we would like to read, etc.
+	// So lowest prescaler as possible is best. Prescaler 8 chosen because it seems beyond this is too fast.
+	MODIFY_REG(hspi1.Instance->CR1, SPI_CR1_BR, SPI_BAUDRATEPRESCALER_8);
+
+	// Re-enable the SPI
+	__HAL_SPI_ENABLE(&hspi1);
+
+	// 0. Mount SD card
+	sd_mount();
+
+	// 1a. Prepare to read Music folder
+	DIR dir;
+	FILINFO fno;
+	FRESULT res;
+
+	res = f_opendir(&dir, "Music");
+	if (res != FR_OK) {
+		printf("Failed to open Music directory with error: %d\r\n", res);
+		return 1;
+	}
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+	// 1b. For every WAV file in Music folder:
+	while (1) {
+		data_bytes_read = 0; // Variable to store the number of bytes read from the data chunk
+		skip = 12; // RIFF chunk is size 12 so this first initialised value skips to the chunk after RIFF
+		skip_fmt = 0; // skip variable to record down the start of the fmt chunk's useful data
+		skip_data = 0; // skip variable to record down the start of the data chunk's useful data
+
+		char fullname[256] = "Music/";
+		res = f_readdir(&dir, &fno);
+
+		// No more WAV files to read
+		if (res != FR_OK || fno.fname[0] == 0) {
+			f_closedir(&dir);
+			__WFI();
+		}
+
+		// If we stumble upon a subfolder
+		if (fno.fattrib & AM_DIR) {
+			continue; // skip
+		}
+
+		// If we stumble upon a regular file
+		// Get its name
+		char *name = fno.fname;
+		// Check whether it is a .wav file
+		if (!has_wav_extension(name)) {
+			continue; // skip
+		}
+
+		strcat(fullname, name);
+		// 2. Initialise reading wav file
+		// Read first 12 bytes.
+		sd_wav_init(fullname, riff_header_chunk, sizeof(riff_header_chunk),
+				&br);
+
+		// Ensure it is RIFF....WAVE
+		// Because array slicing doesn't exist in C, it is a hassle to use memcmp to verify the riff_header_chunk contents
+		// So just use "brute force"
+		if (riff_header_chunk[0] != 0x52 || // R
+				riff_header_chunk[1] != 0x49 || // I
+				riff_header_chunk[2] != 0x46 || // F
+				riff_header_chunk[3] != 0x46 || // F
+				riff_header_chunk[8] != 0x57 || // W
+				riff_header_chunk[9] != 0x41 || // A
+				riff_header_chunk[10] != 0x56 || // V
+				riff_header_chunk[11] != 0x45)   // E
+						{
+			printf("Only .wav files permitted.\r\n");
+			return 2;
+		}
+
+		// 3. Determine the file size. This is useful to compare against the skip variable later to know when we reach file end
+		// File size in bytes is the elements 4 through 7 of riff_header_chunk, in little-endian mode, plus 8.
+		file_size_dec = (((uint32_t) riff_header_chunk[4])
+				| ((uint32_t) riff_header_chunk[5] << 8)
+				| ((uint32_t) riff_header_chunk[6] << 16)
+				| ((uint32_t) riff_header_chunk[7] << 24)) + 8;
+
+		ARR = __HAL_TIM_GET_AUTORELOAD(&htim5);
+
+		// 4. Find the fmt and data chunks
+		while (skip < file_size_dec) {
+			// Read the next 4 bytes which is the chunk identifier
+			sd_wav_read(fullname, chunk_id, sizeof(chunk_id), skip, &br);
+			skip += (uint32_t) sizeof(chunk_id); // Progress the skip value
+
+			// Read the next 4 bytes which is the chunk size
+			sd_wav_read(fullname, chunk_size, sizeof(chunk_size), skip, &br);
+			skip += (uint32_t) sizeof(chunk_size); // Progress the skip value
+			chunk_size_dec = ((uint32_t) chunk_size[0])
+					| ((uint32_t) chunk_size[1] << 8)
+					| ((uint32_t) chunk_size[2] << 16)
+					| ((uint32_t) chunk_size[3] << 24); // Little-endian: the first byte is actually the least significant byte!
+
+			// Detect where the fmt chunk is
+			if (memcmp(chunk_id, exp_fmt, (int) sizeof(exp_fmt)) == 0) {
+				skip_fmt = skip;
+				fmt_size_dec = chunk_size_dec;
+			}
+			// Detect where the data chunk is
+			else if (memcmp(chunk_id, exp_data, (int) sizeof(exp_data)) == 0) {
+				skip_data = skip;
+				data_start = skip;
+				data_size_dec = chunk_size_dec;
+			}
+			// Skip any other chunk
+			else {
+				printf("Skipped %4s chunk.\r\n", chunk_id);
+			}
+
+			skip += chunk_size_dec;
+
+			if ((skip_fmt != 0) && (skip_data != 0)) {
+				break;
+			}
+		}
+
+		// 5. Process the fmt chunk
+		// Verify chunk size = 16 for PCM WAV (i.e., standard, uncompressed PCM WAV)
+		if (fmt_size_dec != exp_fmt_sz_dec) {
+			printf("Given .wav file not standard PCM.\r\n");
+			return 3;
+		}
+
+		// Read the next 2 bytes. This is the "audio format". Verify it is 1 for standard, uncompressed PCM WAV
+		sd_wav_read(fullname, audio_fmt, sizeof(audio_fmt), skip_fmt, &br);
+		skip_fmt += (uint32_t) sizeof(audio_fmt); // Progress the skip value
+		if (memcmp(audio_fmt, exp_audio_fmt, sizeof(exp_audio_fmt)) != 0) {
+			printf("Given .wav file not standard PCM.\r\n");
+			return 4;
+		}
+
+		// Read the next 2 bytes. This is the number of channels. Verify it is 1 or 2 (only support mono or stereo)
+		sd_wav_read(fullname, channels, sizeof(channels), skip_fmt, &br);
+		skip_fmt += (uint32_t) sizeof(channels); // Progress the skip value
+		if (memcmp(channels, stereo, sizeof(stereo)) != 0) {
+			printf("Given .wav file not stereo.\r\n");
+			return 5;
+		}
+		channels_dec = ((uint32_t) channels[0]) | ((uint32_t) channels[1] << 8);
+
+		// Read the next 4 bytes. This is the sample rate (in Hz)
+		sd_wav_read(fullname, sample_rate, sizeof(sample_rate), skip_fmt, &br);
+		skip_fmt += (uint32_t) sizeof(sample_rate); // Progress the skip value
+		sample_rate_dec = ((uint32_t) sample_rate[0])
+				| ((uint32_t) sample_rate[1] << 8)
+				| ((uint32_t) sample_rate[2] << 16)
+				| ((uint32_t) sample_rate[3] << 24);
+
+		// Read the next 4 bytes. This is the byte rate (in Bps)
+		sd_wav_read(fullname, byte_rate, sizeof(byte_rate), skip_fmt, &br);
+		skip_fmt += (uint32_t) sizeof(byte_rate); // Progress the skip value
+		byte_rate_dec = ((uint32_t) byte_rate[0])
+				| ((uint32_t) byte_rate[1] << 8)
+				| ((uint32_t) byte_rate[2] << 16)
+				| ((uint32_t) byte_rate[3] << 24);
+
+		// Read the next 2 bytes. This is the block align (in bytes per block)
+		sd_wav_read(fullname, block_align, sizeof(block_align), skip_fmt, &br);
+		skip_fmt += (uint32_t) sizeof(block_align); // Progress the skip value
+		block_align_dec = ((uint32_t) block_align[0])
+				| ((uint32_t) block_align[1] << 8);
+
+		// Read the next 2 bytes. This is the sample depth (in bits). Then divide by 8 to get bytes per sample
+		sd_wav_read(fullname, sample_depth, sizeof(sample_depth), skip_fmt,
+				&br);
+		skip_fmt += (uint32_t) sizeof(sample_depth); // Progress the skip value
+		bytes_per_sample_dec = (((uint32_t) sample_depth[0])
+				| ((uint32_t) sample_depth[1] << 8)) / 8;
+
+		// We will not support 32-bit or more sample depth files because those are uncommon and require a bit more code
+		if (bytes_per_sample_dec >= 4) {
+			printf(
+					"Sample depth %u bits too large and unsupported. Must be 8, 16, or 24.",
+					bytes_per_sample_dec);
+			return 6;
+		}
+		// Finish processing fmt chunk
+
+
+		// 6. Process the data chunk
+		// 6a. Open the file
+		FRESULT res = f_open(&file, fullname, FA_READ);
+		if (res != FR_OK) {
+			printf("f_open failed with code: %d\r\n", res);
+			return res;
+		}
+
+		// 6b. Read the first 8192 bytes of data
+		// Fill first half of ccr's
+		process_pcm(1, ARR);
+		// Fill second half of ccr's
+		process_pcm(2, ARR);
+
+		// 6c. Send to PWM
+		// Actually, if audio was stereo to begin with, you'll only use half of the CCR array
+		HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_1, (uint32_t*) ccr_l,
+				sizeof(ccr_l) / sizeof(ccr_l[0]));
+		HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
+				sizeof(ccr_r) / sizeof(ccr_r[0]));
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+		while (1) {
+			button_state = process_button();
+
+			// If Idle and play is on, play as per normal
+			if (button_state == BUTTON_IDLE) {
+				if (play) {
+					if (data_bytes_read < data_size_dec) {
+						if (refill_request == REFILL_FIRST) {
+							refill_request = REFILL_NONE;
+							// Function to replace the first half of ccr's
+							process_pcm(1, ARR);
+						} else if (refill_request == REFILL_SECOND) {
+							refill_request = REFILL_NONE;
+							// Function to replace the second half of ccr's
+							process_pcm(2, ARR);
+						}
+					} else if (data_bytes_read == data_size_dec) {
+						// You have now finished reading the PCM data
+						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
+						HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
+
+						res = f_close(&file);
+						if (res != FR_OK) {
+							printf("f_close failed with code: %d\r\n", res);
+							return res;
+						}
+
+						// Verify that we have read the entire data chunk upon unmount
+						printf("Bytes of data read: %lu bytes\r\n", data_bytes_read);
+						printf("Bytes of data actually there: %lu bytes \r\n",
+								data_size_dec);
+						printf("DATA chunk processed. Step 4 success.\r\n\n");
+
+						break;
+					}
+				}
+			// Else if Single Press, alternate between pausing and resuming
+			} else if (button_state == BUTTON_SINGLE_PRESS) {
+				if (play) {
+					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_1);
+					HAL_TIM_PWM_Stop_DMA(&htim5, TIM_CHANNEL_2);
+					play = !play;
+				} else {
+					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_1, (uint32_t*) ccr_l,
+									sizeof(ccr_l) / sizeof(ccr_l[0]));
+					HAL_TIM_PWM_Start_DMA(&htim5, TIM_CHANNEL_2, (uint32_t*) ccr_r,
+							sizeof(ccr_r) / sizeof(ccr_r[0]));
+					play = !play;
+				}
+				waiting = 0;
+			// Else if Double press, skip song. Done by setting data_bytes_read to data_size_dec to force to end.
+			} else if (button_state == BUTTON_DOUBLE_PRESS) {
+				waiting = 0;
+				data_bytes_read = data_size_dec;
+			// Else if Long press, rewind song. Done by just resetting data_bytes_read and skip_data
+			} else if (button_state == BUTTON_LONG_PRESS) {
+				waiting = 0;
+				data_bytes_read = 0;
+				skip_data = data_start;
+			}
+		}
+		HAL_Delay(1000);
+	}
+	f_closedir(&dir);
+	sd_unmount();
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 15;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM5_Init(void)
+{
+
+  /* USER CODE BEGIN TIM5_Init 0 */
+
+  /* USER CODE END TIM5_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM5_Init 1 */
+
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 1-1;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 2000-1;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM5_Init 2 */
+
+  /* USER CODE END TIM5_Init 2 */
+  HAL_TIM_MspPostInit(&htim5);
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* DMA1_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI1_CS_Pin */
+  GPIO_InitStruct.Pin = SPI1_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(SPI1_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
+	}
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

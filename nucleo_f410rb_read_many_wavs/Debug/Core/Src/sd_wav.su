@@ -1,2 +1,2 @@
-../Core/Src/sd_wav.c:19:5:sd_wav_init	600	static
-../Core/Src/sd_wav.c:47:5:sd_wav_read	600	static
+../Core/Src/sd_wav.c:21:5:sd_wav_init	600	static
+../Core/Src/sd_wav.c:51:5:sd_wav_read	600	static

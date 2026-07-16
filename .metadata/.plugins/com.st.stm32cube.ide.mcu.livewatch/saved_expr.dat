@@ -1,3 +1,15 @@
 sd_path
 directory
 audio_fmt
+skip
+skip_fmt
+skip_data
+riff_header_chunk
+chunk_id
+chunk_size
+data_size_dec
+audio_fmt
+channels
+sample_rate_dec
+button_state
+ccr_l
